@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <title>Snake.io style - PyScript + HTML5 Canvas</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #0f0f1a;
+      color: #e5e7eb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    #wrap {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas#game {
+      width: min(100vw, 1200px);
+      height: min(100vh, 800px);
+      background: #0f0f1a;
+      border: 0;
+      box-shadow: 0 0 0 0 rgba(0,0,0,0);
+      display: block;
+    }
+    .hint {
+      position: absolute;
+      inset: 0 0 auto 0;
+      text-align: center;
+      padding: 8px 12px;
+      font-size: 12px;
+      color: #a1a1aa;
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+
+  <!-- PyScript (latest) -->
+  <link rel="stylesheet" href="https://pyscript.net/latest/pyscript.css" />
+  <script type="module" src="https://pyscript.net/latest/pyscript.js"></script>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game"></canvas>
+    <div class="hint">Chuột để lái (M để chuyển sang phím mũi tên), Space: Boost, P: Tạm dừng, R: Chơi lại</div>
+  </div>
+
+  <py-script>
+import math
+import random
+from js import document, window, Math
+from pyodide.ffi import create_proxy
+
+# =========================
+# Config
+# =========================
+BG_COLOR = "#0f0f1a"
+PELLET_COLOR = "#ffd54f"
+SNAKE_COLOR = "#6ee7b7"
+SNAKE_OUTLINE = "#34d399"
+TEXT_COLOR = "#e5e7eb"
+
+PELLET_RADIUS = 4.0
+PELLET_COUNT = 120
+
+SNAKE_RADIUS = 10.0
+BASE_SPEED = 160.0     # pixels/second
+BOOST_SPEED = 260.0    # pixels/second
+
+TURN_RATE_MOUSE = 999.0         # radians/second (gần như bám theo chuột)
+TURN_RATE_KEYS = 3.2            # radians/second
+
+POINT_SPACING = 2.0             # khoảng cách đều giữa các điểm thân (px)
+INITIAL_LENGTH = 80.0           # chiều dài ban đầu (px) ~ 40 điểm * 2px
+GROWTH_PER_PELLET = 40.0        # dài thêm mỗi khi ăn pellet (px)
+
+SELF_COLLISION_SKIP_DIST = 36.0 # bỏ qua đoạn sát đầu (px)
+SELF_COLLISION_DIST = SNAKE_RADIUS * 0.9
+
+MAX_DT = 0.05  # clamp dt để tránh giật khi tab bị treo (~50ms)
+
+def angle_lerp(current, target, max_delta):
+    # chọn hướng quay ngắn nhất
+    diff = (target - current + math.pi) % (2 * math.pi) - math.pi
+    if diff > max_delta:
+        diff = max_delta
+    elif diff < -max_delta:
+        diff = -max_delta
+    return current + diff
+
+def distance(x1, y1, x2, y2):
+    return math.hypot(x2 - x1, y2 - y1)
+
+class SnakeGame:
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self.ctx = canvas.getContext("2d")
+
+        # DPI scaling
+        self._resize_proxy = create_proxy(self.on_resize)
+        window.addEventListener("resize", self._resize_proxy)
+        self.on_resize(None)
+
+        # Inputs
+        self.mouse_x = self.width * 0.5
+               self.mouse_y = self.height * 0.5
+        self.turn_left = False
+        self.turn_right = False
+        self.boost = False
+        self.use_mouse_steer = True
+        self.paused = False
+        self.game_over = False
+
+        # Event listeners
+        self._mm_proxy = create_proxy(self.on_mouse_move)
+        self.canvas.addEventListener("mousemove", self._mm_proxy)
+
+        self._kd_proxy = create_proxy(self.on_key_down)
+        self._ku_proxy = create_proxy(self.on_key_up)
+        document.addEventListener("keydown", self._kd_proxy)
+        document.addEventListener("keyup", self._ku_proxy)
+
+        # Init game
+        self.reset_game()
+
+        # Loop
+        self.last_ts = None
+        self._raf_proxy = create_proxy(self._on_frame)
+        window.requestAnimationFrame(self._raf_proxy)
+
+    # --------------- Lifecycle ---------------
+    def on_resize(self, evt):
+        rect = self.canvas.getBoundingClientRect()
+        self.css_w = rect.width
+        self.css_h = rect.height
+        dpr = window.devicePixelRatio or 1
+        self.dpr = dpr
+        self.canvas.width = int(self.css_w * dpr)
+        self.canvas.height = int(self.css_h * dpr)
+        # setTransform để dùng toạ độ theo CSS pixel
+        self.ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        self.width = self.css_w
+        self.height = self.css_h
+
+    def reset_game(self):
+        self.head_x = self.width * 0.5
+        self.head_y = self.height * 0.5
+        self.angle = 0.0
+
+        # Path thân: danh sách điểm (từ đuôi -> gần đầu), khoảng cách đều POINT_SPACING
+        self.body_points = []
+        # khởi tạo đường thẳng ban đầu phía sau đầu
+        points_needed = int(INITIAL_LENGTH // POINT_SPACING)
+        for i in range(points_needed):
+            self.body_points.append((self.head_x - (points_needed - i) * POINT_SPACING, self.head_y))
+
+        self.max_length_px = INITIAL_LENGTH
+        self.score = 0
+
+        # Pellets
+        self.pellets = []
+        for _ in range(PELLET_COUNT):
+            self.add_pellet()
+
+        self.paused = False
+               self.game_over = False
+
+    # --------------- Inputs ---------------
+    def on_mouse_move(self, e):
+        # offsetX/Y là theo canvas (CSS px)
+        self.mouse_x = e.offsetX
+        self.mouse_y = e.offsetY
+
+    def on_key_down(self, e):
+        key = (e.key or "").lower()
+        code = e.code or ""
+        if key in ("arrowleft",) or key == "a":
+            self.turn_left = True
+            e.preventDefault()
+        elif key in ("arrowright",) or key == "d":
+            self.turn_right = True
+            e.preventDefault()
+        elif key == " " or key == "spacebar":
+            self.boost = True
+            e.preventDefault()
+        elif key == "m":
+            self.use_mouse_steer = not self.use_mouse_steer
+        elif key == "p":
+            self.paused = not self.paused
+        elif key == "r":
+            self.reset_game()
+
+    def on_key_up(self, e):
+        key = (e.key or "").lower()
+        if key in ("arrowleft",) or key == "a":
+            self.turn_left = False
+            e.preventDefault()
+        elif key in ("arrowright",) or key == "d":
+            self.turn_right = False
+            e.preventDefault()
+        elif key == " " or key == "spacebar":
+            self.boost = False
+            e.preventDefault()
+
+    # --------------- Game logic ---------------
+    def add_pellet(self):
+        # tránh spawn quá sát đầu
+        for _ in range(100):
+            x = random.uniform(20, self.width - 20)
+            y = random.uniform(20, self.height - 20)
+            if distance(x, y, self.head_x, self.head_y) > 80:
+                self.pellets.append((x, y))
+                return
+        # fallback
+        self.pellets.append((random.uniform(0, self.width), random.uniform(0, self.height)))
+
+    def wrap_position(self, x, y):
+        wrapped = False
+        if x < 0:
+            x += self.width
+            wrapped = True
+        elif x > self.width:
+            x -= self.width
+            wrapped = True
+        if y < 0:
+            y += self.height
+            wrapped = True
+        elif y > self.height:
+            y -= self.height
+            wrapped = True
+        return x, y, wrapped
+
+    def _append_along_path(self, to_x, to_y, wrapped=False):
+        # Thêm các điểm theo khoảng cách đều. Nếu vừa wrap, chỉ thêm điểm đầu (tạo đứt đoạn thẩm mỹ)
+        if not self.body_points:
+            self.body_points.append((to_x, to_y))
+            return
+
+        last_x, last_y = self.body_points[-1]
+
+        if wrapped:
+            # chỉ thêm điểm ở vị trí mới để "ngắt" đường cho sạch
+            self.body_points.append((to_x, to_y))
+        else:
+            dx = to_x - last_x
+            dy = to_y - last_y
+            dist = math.hypot(dx, dy)
+            if dist == 0:
+                return
+            steps = int(dist // POINT_SPACING)
+            if steps == 0:
+                # khoảng cách nhỏ hơn spacing, kết nối trực tiếp bằng 1 điểm (ít ảnh hưởng)
+                self.body_points.append((to_x, to_y))
+            else:
+                ux = dx / dist
+                uy = dy / dist
+                for i in range(1, steps + 1):
+                    px = last_x + ux * POINT_SPACING * i
+                    py = last_y + uy * POINT_SPACING * i
+                    self.body_points.append((px, py))
+                # nếu còn dư, thêm điểm cuối chính xác
+                if dist - steps * POINT_SPACING > 1e-6:
+                    self.body_points.append((to_x, to_y))
+
+        # Cắt đuôi theo chiều dài tối đa
+        max_points = max(1, int(self.max_length_px // POINT_SPACING))
+        while len(self.body_points) > max_points:
+            self.body_points.pop(0)
+
+    def step(self, dt):
+        # Xoay
+        if self.use_mouse_steer:
+            target_angle = math.atan2(self.mouse_y - self.head_y, self.mouse_x - self.head_x)
+            self.angle = angle_lerp(self.angle, target_angle, TURN_RATE_MOUSE * dt)
+        else:
+            if self.turn_left and not self.turn_right:
+                self.angle -= TURN_RATE_KEYS * dt
+            elif self.turn_right and not self.turn_left:
+                self.angle += TURN_RATE_KEYS * dt
+
+        # Tốc độ
+        speed = BOOST_SPEED if self.boost else BASE_SPEED
+
+        # Di chuyển
+        vx = math.cos(self.angle) * speed * dt
+        vy = math.sin(self.angle) * speed * dt
+        new_x = self.head_x + vx
+        new_y = self.head_y + vy
+        new_x, new_y, wrapped = self.wrap_position(new_x, new_y)
+
+        # Cập nhật thân
+        self._append_along_path(new_x, new_y, wrapped=wrapped)
+
+        # Cập nhật đầu
+        self.head_x, self.head_y = new_x, new_y
+
+        # Ăn pellets
+        self.check_pellet_collisions()
+
+        # Tự va chạm
+        if self.check_self_collision():
+            self.game_over = True
+
+    def check_pellet_collisions(self):
+        hx, hy = self.head_x, self.head_y
+        rr = (SNAKE_RADIUS + PELLET_RADIUS) ** 2
+        eaten_idx = []
+        for i, (px, py) in enumerate(self.pellets):
+            if (hx - px) ** 2 + (hy - py) ** 2 <= rr:
+                eaten_idx.append(i)
+        if eaten_idx:
+            for i in reversed(eaten_idx):
+                self.pellets.pop(i)
+            n = len(eaten_idx)
+            self.score += n
+            self.max_length_px += GROWTH_PER_PELLET * n
+            for _ in range(n):
+                self.add_pellet()
+
+    def check_self_collision(self):
+        if not self.body_points:
+            return False
+        hx, hy = self.head_x, self.head_y
+        # số điểm cần bỏ qua sát đầu
+        skip_pts = int(SELF_COLLISION_SKIP_DIST // POINT_SPACING)
+        # duyệt tới điểm cách xa đầu
+        upto = max(0, len(self.body_points) - skip_pts)
+        thr = SELF_COLLISION_DIST
+        thr2 = thr * thr
+        for (x, y) in self.body_points[:upto]:
+            dx = hx - x
+            dy = hy - y
+            if dx * dx + dy * dy <= thr2:
+                return True
+        return False
+
+    # --------------- Render ---------------
+    def draw(self):
+        ctx = self.ctx
+        w, h = self.width, self.height
+
+        # Clear
+        ctx.save()
+        ctx.setTransform(self.dpr, 0, 0, self.dpr, 0, 0)  # đảm bảo đang ở CSS px
+        ctx.clearRect(0, 0, w, h)
+        ctx.fillStyle = BG_COLOR
+        ctx.fillRect(0, 0, w, h)
+
+        # Pellets
+        ctx.fillStyle = PELLET_COLOR
+        for (px, py) in self.pellets:
+            ctx.beginPath()
+            ctx.arc(px, py, PELLET_RADIUS, 0, math.tau)
+            ctx.fill()
+
+        # Snake body as path with round caps/join
+        if len(self.body_points) >= 1:
+            ctx.lineWidth = SNAKE_RADIUS * 2
+            ctx.strokeStyle = SNAKE_COLOR
+            ctx.lineJoin = "round"
+            ctx.lineCap = "round"
+
+            pts = self.body_points + [(self.head_x, self.head_y)]
+            # Vẽ theo từng đoạn, tránh nối qua mép (wrap) bằng cách ngắt nếu khoảng cách quá lớn
+            ctx.beginPath()
+            for i, (x, y) in enumerate(pts):
+                if i == 0:
+                    ctx.moveTo(x, y)
+                    continue
+                px, py = pts[i - 1]
+                # nếu nhảy quãng lớn (wrap), bắt đầu subpath mới
+                if abs(x - px) > w * 0.5 or abs(y - py) > h * 0.5:
+                    ctx.moveTo(x, y)
+                else:
+                    ctx.lineTo(x, y)
+            ctx.stroke()
+
+        # Head outline
+        hx, hy = self.head_x, self.head_y
+        r = SNAKE_RADIUS
+        ctx.lineWidth = 2
+        ctx.strokeStyle = SNAKE_OUTLINE
+        ctx.beginPath()
+        ctx.arc(hx, hy, r, 0, math.tau)
+        ctx.stroke()
+        ctx.fillStyle = SNAKE_COLOR
+        ctx.beginPath()
+        ctx.arc(hx, hy, r - 2, 0, math.tau)
+        ctx.fill()
+
+        # Eye
+        ex = hx + math.cos(self.angle) * (r * 0.5)
+        ey = hy + math.sin(self.angle) * (r * 0.5)
+        ctx.fillStyle = "#111827"
+        ctx.beginPath()
+        ctx.arc(ex, ey, 2, 0, math.tau)
+        ctx.fill()
+
+        # HUD
+        steer_text = "Mouse" if self.use_mouse_steer else "Arrows"
+        boost_text = "ON" if self.boost else "OFF"
+        status = f"Score: {self.score}  |  Control: {steer_text} (M)  |  Boost: {boost_text} (Space)  |  Pause: P  |  Reset: R"
+        ctx.fillStyle = TEXT_COLOR
+        ctx.font = "12px Consolas, monospace"
+        ctx.textAlign = "center"
+        ctx.textBaseline = "top"
+        ctx.fillText(status, w * 0.5, 8)
+
+        if self.paused:
+            ctx.fillStyle = "#93c5fd"
+            ctx.font = "28px Consolas, monospace"
+            ctx.textAlign = "center"
+            ctx.textBaseline = "middle"
+            ctx.fillText("PAUSED\nPress P to resume", w * 0.5, h * 0.5)
+        if self.game_over:
+            ctx.fillStyle = "#fca5a5"
+            ctx.font = "28px Consolas, monospace"
+            ctx.textAlign = "center"
+            ctx.textBaseline = "middle"
+            ctx.fillText("GAME OVER\nPress R to restart", w * 0.5, h * 0.5)
+
+        ctx.restore()
+
+    # --------------- RAF loop ---------------
+    def _on_frame(self, ts):
+        if self.last_ts is None:
+            self.last_ts = ts
+        dt = (ts - self.last_ts) / 1000.0
+        if dt > MAX_DT:
+            dt = MAX_DT
+        self.last_ts = ts
+
+        if not self.paused and not self.game_over:
+            self.step(dt)
+        self.draw()
+        window.requestAnimationFrame(self._raf_proxy)
+
+# Bootstrap
+canvas = document.getElementById("game")
+game = SnakeGame(canvas)
+  </py-script>
+</body>
+</html>
